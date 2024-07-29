@@ -1,30 +1,20 @@
-
-/*******************Arduino通用库************************/
+#include <Adafruit_ADXL345_U.h>
+#include <Adafruit_NeoPixel.h>
+#include <Adafruit_Sensor.h>
 #include <Arduino.h>
-
-/*******************音频文件处理库***********************/
 #include <Audio.h>
 #include <FS.h>
 #include <LittleFS.h>
-
-/*******************I2C ADXL传感器库*********************/
-#include <Adafruit_ADXL345_U.h>
-#include <Adafruit_Sensor.h>
-#include <Wire.h>
-
-/*******************LED灯库*****************************/
-#include <Adafruit_NeoPixel.h>
-
-/*******************NVS库******************************/
 #include <Preferences.h>
-#include <esp_system.h>
+#include <Wire.h>
+#include <esp_task_wdt.h>
 
 #define DEBUG 1  // DEBUG模式
 
 // MAX98357数字功放模块参数
-#define I2S_DOUT 11
-#define I2S_BCLK 12
-#define I2S_LRC 13
+#define I2S_MAX98357_DOUT 11
+#define I2S_MAX98357_BCLK 12
+#define I2S_MAX98357_LRC 13
 
 // 微型震动马达
 #define MOTOR_PIN 1  // 震动马达mos栅极
@@ -32,103 +22,131 @@
 // WS2812灯带实例化
 #define LED_PIN 41
 #define LED_COUNT 52
-#define MAXBRIGHT 50
+#define LED_BRIGHT 50
 
 // ADXL345加速度传感器模块参数
-#define I2C_MASTER_SCL_IO 36
-#define I2C_MASTER_SDA_IO 37
+#define I2C_ADXL345_SCL 36
+#define I2C_ADXL345_SDA 37
+
+// 功能按钮
+#define BUTTON_PIN 18
+
+// 预定颜色定义
+#define ICE_BLUE 0, 255, 255       // 冰蓝色
+#define TIFFANY_GREEN 0, 255, 153  // 蒂芙尼绿色
+#define RED 255, 0, 0              // 红色
 
 // 大师剑的几种状态
 enum SwordStatus {
-    STATUS_INIT,    // 开机状态
-    STATUS_NORMAL,  // 通常状态
-    STATUS_FIGHT,   // 战斗状态
-    STATUS_IDLE     // 空闲状态
+    STATUS_INIT,    // 开机状态 剑身不亮，单击触发震动，逐渐点亮蓝色剑身，并播放001.wav 之后进入通常状态，闲时超过60秒进入展示状态
+    STATUS_NORMAL,  // 通常状态 剑身蓝色，挥动触发特效，双击更改挥动特效，长按进入战斗状态，触发震动，并播放002.wav
+    STATUS_FIGHT,   // 战斗状态 剑身红色，挥动触发特效，双击更改挥动特效，单击返回普通模式，触发震动，并播放003.wav
+    STATUS_DISPLAY  // 展示状态 剑身炫彩，双击拾音灯功能，单击返回普通状态，触发震动，并播放003.wav
 };
 
-// LittleFS中需要调用的音频文件列表
-const char* const music_list[] = {
-    "/001.wav", "/002.wav", "/003.wav"};
+// 触发器的几种状态
+enum TriggerState {
+    TRIG_CLICK,   // 单击
+    TRIG_DBCLCK,  // 双击
+    TRIG_PRESS,   // 长按
+    TRIG_SWING,   // 挥动
+    TRIG_IDLE     // 空闲状态
+};
 
-// 对象实例
-Audio audio;
-Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
-sensors_event_t accel_event;
-Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+// LED的几种效果
+enum LedEffect {
+    LED_ON,       // 常量
+    LED_OFF,      // 熄灭
+    INCREASE_UP,  // 逐渐点亮
+    BRIGHTNESS,   // 闪耀
+    COLORFUL      // 炫彩
+};
+
+// 实例对象
+Audio audio;                                                        // 音频对象
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);   // 加速度传感器对象
+sensors_event_t accel_event;                                        // 加速度传感器事件
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);  // WS2812灯带对象
 
 // 全局变量
-volatile SwordStatus music_status;
-
-// 顺时针扭转 X轴基本不变化，Y轴和Z轴会增加
-// 逆时针扭转 X轴基本不变化，Y轴和Z轴会减小
-// 前刺 X轴减小，Y和Z基本不变化
-// 挥动 XYZ都会有变化
+volatile SwordStatus swordStatus = STATUS_INIT;  // 大师剑状态
+volatile TriggerState triggerState = TRIG_IDLE;  // 触发器
+volatile LedEffect ledEffect = LED_OFF;          // LED效果
 
 // 加速度参数
-static float prevAccel[3] = {0.0f, 0.0f, 0.0f};      // 当前加速度值
-static float currAccel[3] = {0.0f, 0.0f, 0.0f};      // 上一次加速度值
-static float filteredAccel[3] = {0.0f, 0.0f, 0.0f};  // 平滑后的加速度值
+static float prevAccel[3] = {0.0f, 0.0f, 0.0f};  // 当前加速度值
+static float currAccel[3] = {0.0f, 0.0f, 0.0f};  // 上一次加速度值
+
+
+// 按键参数
+volatile boolean buttonPressed = false;   // 按键按下
+volatile boolean buttonReleased = false;  // 按键释放
+volatile boolean longPress = false;       // 按键长按
+volatile boolean dobleClicked = false;    // 按键双击
+
+static unsigned long lastButtonTime = 0;  // 上次按键时间
+volatile int buttonLevel = 0;                // 按键电平
+volatile int clickCount = 0;  // 按键计数器
+const unsigned long BUTTON_TIMEOUT = 50;         // 按键超时时间 (毫秒)
+const unsigned long DOUBLE_CLICK_TIMEOUT = 300;  // 双击超时时间 (毫秒)
+const unsigned long PRESS_TIMEOUT = 1000;        // 长按超时时间 (毫秒)
+
+
+
+// 动作开始计时器
+static unsigned long motorTimer = 0;  // 震动马达开始时间
+static unsigned long audioTimer = 0;  // 音频播放开始时间
+static unsigned long ledTimer = 0;    // Led效果开始时间
+static unsigned long idleTimer = 0;   // 闲时计时开始时间
+
+// 上次检测时间
+
+static unsigned long lastSwingTime = 0;   // 上次挥动时间
+static unsigned long lastClickTime = 0;   // 上次单击时间
+
+// 计数器
+
+volatile int ledCount = 0;    // led计数器
 
 // 平滑加速度数据的滤波器系数
 const float FILTER_ALPHA = 0.1f;
 
-// 扭转加速度变化阈值
-const float TWIST_THRESHOLD = 5.0f;          // 顺时针翻转阈值
-const float REVERSE_TWIST_THRESHOLD = 5.0f;  // 逆时针翻转阈值
-
-// 前刺加速度变化阈值
-const float THRUST_Y_THRESHOLD = 3.0f;
-const float THRUST_Z_THRESHOLD = 3.0f;
-
-// 挥动动作的阈值
-const float SWING_THRESHOLD = 5.0f;
-
-// 触发器
-bool fightTriggered = false;   // 战斗触发器
-bool normalTriggered = false;  // 普通触发器
-bool swingTriggered = false;   // 挥动触发器
-bool thrustTriggered = false;  // 前刺触发器
-
-const float TWIST_X_THRESHOLD = 5.0f;
+// 挥动动作的阈值 忽略XYZ 关注加速度变化
+const float SWING_THRESHOLD = 1.0f;
 
 // 状态冷却时间（毫秒）
-const unsigned long TWIST_COOLDOWN = 1000;          // 顺时针扭转冷却
-const unsigned long REVERSE_TWIST_COOLDOWN = 1000;  // 逆时针扭转冷却
-const unsigned long THRUST_COOLDOWN = 1000;         // 前刺冷却
-const unsigned long SWING_COOLDOWN = 1000;          // 挥动冷却
 
-// 上次状态更改的时间戳
-static unsigned long currentTime = 0;
-static unsigned long lastActionTime = 0;
+const unsigned long SWING_TIMEOUT = 2000;        // 挥动超时时间 (毫秒)
+
+const unsigned long MOTOR_TIMEOUT = 500;         // 马达超时时间 (毫秒)
+const unsigned long IDLE_TIMEOUT = 60000;        // 闲时超时时间 (毫秒)
+const unsigned long BRIGHTNESS_TIMEOUT = 500;    // 闪耀特效超时时间 (毫秒)
+// LED延时时间（毫秒）
+const unsigned long INCREASE_UP_TIMEOUT = 30;  // 逐渐点亮延时时间 (毫秒)
+
+// LittleFS中需要调用的音频文件列表，使用方式例：调用002.wav 使用music_list[1]
+volatile int audioNumber = 0;  // 音频No
+const char* const music_list[] = {
+    "/001.wav", "/002.wav", "/003.wav"};
 
 // 函数声明
-void detectActions();
-void updateLEDAndActions();
-void setLEDColor(uint8_t r, uint8_t g, uint8_t b);
-void triggerMotor();
-void adjustBrightnessForSwing();
-void getAccel();
-void detectClockwiseTwist(unsigned long currentTime);
-void detectCounterClockwiseTwist(unsigned long currentTime);
-void detectThrust(unsigned long currentTime);
-void detectSwing(unsigned long currentTime);
-// 删除未使用的变量和函数声明
-// SemaphoreHandle_t xMutex;
-// Preferences prefs;
-// volatile SwordStatus led_status;
+void detectBottons();
+void detectADXL();
+void judgeActions();
+void motorHandler();
+void audioHandler();
+void ledHandler();
 
-// void task_musicplay(void* pvParameters);
-// void task_sens(void* pvParameters);
+void printAccelData(float prev[], float current[]);
+void printStatus();
+void printTrigger();
 
 void setup() {
+    // 开启串口debug输出
     Serial.begin(115200);
     Serial.setDebugOutput(true);
-
     delay(5000);
     Serial.println("Setup started");
-
-    // 开机状态
-    music_status = STATUS_INIT;
 
     // 初始化WS2812
     strip.begin();
@@ -137,223 +155,422 @@ void setup() {
     delay(200);
 
     // 初始化ADXL
-    Wire.begin(I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
+    Wire.begin(I2C_ADXL345_SDA, I2C_ADXL345_SCL);
     if (!accel.begin()) {
         Serial.println("Ooops, no ADXL345 detected ... Check your wiring!");
+        while (1)
+            ;
     }
     accel.setRange(ADXL345_RANGE_16_G);  // 设置ADXL 量程
 
-    // // 初始化I2S MAX98357数字功放模块参数
-    // audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-    // audio.setVolume(21);                   // 音量范围0...21
-    // audio.setBufsize(0, 1 * 1024 * 1024);  // 0表示使用PSRAM
-    // audio.connecttoFS(LittleFS, "/001.wav");
+    // 初始化I2S MAX98357数字功放模块参数
+    audio.setPinout(I2S_MAX98357_BCLK, I2S_MAX98357_LRC, I2S_MAX98357_DOUT);
+    audio.setVolume(21);                   // 音量范围0...21
+    audio.setBufsize(0, 1 * 1024 * 1024);  // 0表示使用PSRAM
+
+    // 初始化功能按钮
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
 
     // 初始化震动马达
     pinMode(MOTOR_PIN, OUTPUT);
 
-    music_status = STATUS_INIT;
-    strip.setBrightness(50);
-    for (int i = 0; i < strip.numPixels(); i++) {
-        strip.setPixelColor(i, 0, 255, 255);  // 冰蓝色
-        strip.show();
-        delay(50);  // 每个LED之间的延迟
-    }
-    Serial.println("Shaking motor...");
-    for (int i = 0; i < 2; i++) {
-        digitalWrite(MOTOR_PIN, HIGH);
-        delay(250);
-        digitalWrite(MOTOR_PIN, LOW);
-        delay(250);
-    }
-    music_status = STATUS_NORMAL;
-    // // 锁对象初始化
-    // xMutex = xSemaphoreCreateMutex();
+    // 打印大师剑和触发器状态
+    printStatus();
+    printTrigger();
 
-    // // 线程规划
-    // xTaskCreate(task_musicplay, "Task 1", 8 * 1024, NULL, 1, NULL);
-    // xTaskCreate(task_sens, "Task 2", 8 * 1024, NULL, 2, NULL);
-    // vTaskStartScheduler();
+    // strip.setBrightness(50);
+    // Serial.println("led start...");
+    // for (int i = 0; i < strip.numPixels(); i++) {
+    //     strip.setPixelColor(i, 0, 255, 255);  // 冰蓝色
+    //     strip.show();
+    //     delay(50);  // 每个LED之间的延迟
+    // }
 }
 
 void loop() {
-    // 检测状态
-    detectActions();
+    // 喂看门狗定时器
+    esp_task_wdt_reset();
+
+    // 音频循环
+    audio.loop();
+
+    // 检测功能按键
+    detectBottons();
+
+    // 检测加速度
+    detectADXL();
 
     // 根据状态更新LED灯带和执行其他逻辑
-    updateLEDAndActions();
-
-    // 更新上一次加速度值
-    prevAccel[0] = currAccel[0];
-    prevAccel[1] = currAccel[1];
-    prevAccel[2] = currAccel[2];
-
-    // 打印加速度数据 (仅在DEBUG模式下)
-#if DEBUG
-    Serial.print("X: ");
-    Serial.print(accel_event.acceleration.x);
-    Serial.print("  Y: ");
-    Serial.print(accel_event.acceleration.y);
-    Serial.print("  Z: ");
-    Serial.print(accel_event.acceleration.z);
-    Serial.println(" m/s^2");
-#endif
+    judgeActions();
 }
 
-void detectActions() {
-    // 检测加速度
-    getAccel();
-    // 当前时间
-    currentTime = millis();
+// 检测功能按键
+void detectBottons() {
 
-    // 检测顺时针扭转
-    detectClockwiseTwist(currentTime);
+    // 读取按键电平
+    buttonLevel = digitalRead(BUTTON_PIN);
 
-    // 检测逆时针扭转
-    detectCounterClockwiseTwist(currentTime);
+    // 消抖处理
+    if (buttonLevel != buttonPressed) {
+        lastButtonTime = millis();
+    }
 
-    // 检测前刺
-    detectThrust(currentTime);
+    // 如果过了冷却时间
+    if ((millis() - lastButtonTime) > BUTTON_TIMEOUT) {
+        // 如果按键被按下
+        if (buttonLevel == LOW && !buttonPressed) {
+            buttonPressed = true;
+            buttonReleased = false;
+            clickCount++;
+            lastClickTime = millis();
+        }
+        // 如果按键被释放
+        else if (buttonLevel == HIGH && buttonPressed) {
+            buttonPressed = false;
+            buttonReleased = true;
 
-    // 检测挥动
-    detectSwing(currentTime);
+            // 检查是否为长按
+            if (millis() - lastClickTime > PRESS_TIMEOUT) {
+                longPress = true;
+            }
+            // 检查是否为双击
+            else if (clickCount == 2 && (millis() - lastClickTime) < DOUBLE_CLICK_TIMEOUT) {
+                dobleClicked = true;
+            } else {
+                clickCount = 0;
+            }
+        }
+    }
 
+    // 检查是否为单击
+    if (buttonReleased && !longPress && !dobleClicked) {
+        triggerState = TRIG_CLICK;  // 触发单击
+        printStatus();
+        printTrigger();
+        buttonReleased = false;  // 重置释放标志
+    }
+
+        // 检查是否为双击
+    if (dobleClicked) {
+        triggerState = TRIG_DBCLCK;  // 触发双击
+        printStatus();
+        printTrigger();
+        dobleClicked = false;  // 重置双击标志
+    }
+        // 检查是否为长按
+    if (longPress) {
+        triggerState = TRIG_PRESS;  // 触发长按
+        printStatus();
+        printTrigger();
+        longPress = false;  // 重置长按标志
+    }
 }
 
 // 检测加速度
-void getAccel() {
+void detectADXL() {
+    // 如果开机状态 或者任意计时器有值则 不检测加速度
+    if (swordStatus == STATUS_INIT || motorTimer != 0 || audioTimer != 0 || ledTimer != 0)
+        return;
 
-    // 从ADXL345传感器获取最新的加速度数据
+    // 取得加速度
     accel.getEvent(&accel_event);
 
-    // 当前加速度值
-    currAccel[0] = accel_event.acceleration.x;
-    currAccel[1] = accel_event.acceleration.y;
-    currAccel[2] = accel_event.acceleration.z;
+    // 判断挥动冷却时间
+    if (millis() - lastSwingTime > SWING_TIMEOUT) {
+        // 平滑加速度数据
+        currAccel[0] = FILTER_ALPHA * accel_event.acceleration.x + (1 - FILTER_ALPHA) * prevAccel[0];
+        currAccel[1] = FILTER_ALPHA * accel_event.acceleration.y + (1 - FILTER_ALPHA) * prevAccel[1];
+        currAccel[2] = FILTER_ALPHA * accel_event.acceleration.z + (1 - FILTER_ALPHA) * prevAccel[2];
 
-    // 用于平滑加速度数据的函数
-    filteredAccel[0] = FILTER_ALPHA * currAccel[0] + (1 - FILTER_ALPHA) * filteredAccel[0];
-    filteredAccel[1] = FILTER_ALPHA * currAccel[1] + (1 - FILTER_ALPHA) * filteredAccel[1];
-    filteredAccel[2] = FILTER_ALPHA * currAccel[2] + (1 - FILTER_ALPHA) * filteredAccel[2];
-}
+        // 检查XYZ轴的总体变化
+        if ((fabs(currAccel[0] - prevAccel[0]) > SWING_THRESHOLD) ||
+            (fabs(currAccel[1] - prevAccel[1]) > SWING_THRESHOLD) ||
+            (fabs(currAccel[2] - prevAccel[2]) > SWING_THRESHOLD)) {
+            // 触发挥动
+            triggerState = TRIG_SWING;
 
-// 检测顺时针扭转
-void detectClockwiseTwist(unsigned long currentTime) {
-    // 检查Y和Z轴的增量
-    if ((currAccel[1] > prevAccel[1]) &&
-        (currAccel[2] > prevAccel[2]) &&
-        (currAccel[0] - prevAccel[0] < TWIST_X_THRESHOLD) &&
-        (currentTime - lastActionTime > TWIST_COOLDOWN)) {
-        if (music_status == STATUS_NORMAL) {
-            music_status = STATUS_FIGHT;  // 或者根据你的逻辑更改状态
-            fightTriggered = true;
-            lastActionTime = currentTime;
+            // 更新挥动的最后时间
+            lastSwingTime = millis();
+
+            // 打印大师剑和触发器状态，触发时间，加速度参数
+            printStatus();
+            printTrigger();
+            Serial.println(millis());
+            printAccelData(prevAccel, currAccel);
         }
     }
+
+    // 更新上一次加速度值
+    prevAccel[0] = accel_event.acceleration.x;
+    prevAccel[1] = accel_event.acceleration.y;
+    prevAccel[2] = accel_event.acceleration.z;
 }
 
-// 检测逆时针扭转
-void detectCounterClockwiseTwist(unsigned long currentTime) {
-    // 检查Y和Z轴的减量
-    if ((currAccel[1] < prevAccel[1]) &&
-        (currAccel[2] < prevAccel[2]) &&
-        (currAccel[0] - prevAccel[0] < TWIST_X_THRESHOLD) &&
-        (currentTime - lastActionTime > REVERSE_TWIST_COOLDOWN)) {
-        if (music_status == STATUS_FIGHT) {
-            music_status = STATUS_NORMAL;  // 或者根据你的逻辑更改状态
-            normalTriggered = true;
-            lastActionTime = currentTime;
-        }
-    }
-}
-
-// 检测前刺
-void detectThrust(unsigned long currentTime) {
-    // 检查X轴的减量
-    if ((currAccel[0] < prevAccel[0]) &&
-        (fabs(currAccel[1] - prevAccel[1]) < THRUST_Y_THRESHOLD) &&
-        (fabs(currAccel[2] - prevAccel[2]) < THRUST_Z_THRESHOLD) &&
-        (currentTime - lastActionTime > THRUST_COOLDOWN)) {
-        // 触发前刺动作
-        // 这里可以加入你的前刺动作逻辑
-        thrustTriggered = true;
-        lastActionTime = currentTime;
-    }
-}
-
-// 检测挥动
-void detectSwing(unsigned long currentTime) {
-    // 检查XYZ轴的总体变化
-    if ((fabs(currAccel[0] - prevAccel[0]) > SWING_THRESHOLD) ||
-        (fabs(currAccel[1] - prevAccel[1]) > SWING_THRESHOLD) ||
-        (fabs(currAccel[2] - prevAccel[2]) > SWING_THRESHOLD) &&
-            (currentTime - lastActionTime > SWING_COOLDOWN)) {
-        // 触发挥动动作
-        // 这里可以加入你的挥动动作逻辑
-        swingTriggered = true;
-        lastActionTime = currentTime;
-    }
-}
-
-void updateLEDAndActions() {
+// 判断动作
+void judgeActions() {
     // 根据状态更新LED灯带
-    switch (music_status) {
+    switch (swordStatus) {
+        // 开机状态
+        case STATUS_INIT:
+
+            switch (triggerState) {
+                // 单击触发开机效果
+                case TRIG_CLICK:
+                    // 延时启动震动电机
+                    if (motorTimer == 0) {
+                        motorTimer = millis() + 5000;
+                    }
+
+                    // 逐渐点亮LED灯
+                    if (ledTimer == 0) {
+                        ledTimer = millis();
+                        ledEffect = INCREASE_UP;
+                    }
+
+                    // 当灯全部点亮播放开机声音
+                    if (audioTimer == 0) {
+                        audioTimer = millis() + 3000;
+                        audioNumber = 0;
+                    }
+                    // 进入普通状态
+                    swordStatus = STATUS_NORMAL;
+                    break;
+
+                // 如果空闲超过60秒进入展示状态
+                case TRIG_IDLE:
+                    if (idleTimer == 0) {
+                        idleTimer = millis();
+
+                    } else if (millis() - idleTimer > IDLE_TIMEOUT) {
+                        idleTimer = 0;
+                        ledEffect = COLORFUL;
+                        // 进入展示状态
+                        swordStatus = STATUS_DISPLAY;
+                    }
+                    break;
+            }
+        // 普通状态
         case STATUS_NORMAL:
 
-            if (fightTriggered) {
-                setLEDColor(255, 0, 0);
-                triggerMotor();
-            }
-            if (swingTriggered) {
-                adjustBrightnessForSwing();
-            }
-            if (thrustTriggered) {
+            switch (triggerState) {
+                case TRIG_DBCLCK:
+
+                    // TODO:切换挥动特效
+                    break;
+
+                case TRIG_PRESS:
+                    // 进入战斗模式
+
+                    // 播放战斗声音
+                    if (audioTimer == 0) {
+                        audioTimer = millis();
+                        audioNumber = 0;
+                    }
+
+                    // 延时启动震动电机
+                    if (motorTimer == 0) {
+                        motorTimer = millis() + 5000;
+                    }
+                    break;
+                case TRIG_SWING:
+
+                    // LED灯增加亮度
+                    if (ledTimer == 0) {
+                        ledTimer = millis();
+                        ledEffect = BRIGHTNESS;
+                    }
+                    break;
+                default:
+                    break;
             }
             break;
+
+        // 战斗状态
         case STATUS_FIGHT:
 
-            if (normalTriggered) {
-                setLEDColor(0, 255, 255);
-                triggerMotor();
+            switch (triggerState) {
+                case TRIG_CLICK:
+                    Serial.println("TRIG_CLICK");
+                    break;
+                case TRIG_DBCLCK:
+                    // TODO:切换挥动特效
+                    break;
+                case TRIG_SWING:
+                    Serial.println("TRIG_SWING");
+                    break;
+                case TRIG_IDLE:
+                    Serial.println("TRIG_IDLE");
+                    break;
+                default:
+                    break;
             }
-            if (swingTriggered) {
-                adjustBrightnessForSwing();
+            break;
+
+        default:
+            break;
+    }
+    triggerState = TRIG_IDLE;
+}
+
+// 处理音频
+void audioHandler() {
+    // 判断计时器有值
+    if (audioTimer != 0 && millis() > audioTimer) {
+        // 如果没有播放音频
+        if (audio.isRunning() == false) {
+            Serial.print("Connecting to ");
+            Serial.print(music_list[audioNumber]);
+            Serial.println(" to play audio...");
+            audio.connecttoFS(LittleFS, music_list[audioNumber]);  // 使用LittleFS和MP3文件路径进行连接
+        } else {
+            audioTimer = 0;
+        }
+    }
+}
+
+// 处理震动
+void motorHandler() {
+    // 判断计时器有值
+    if (motorTimer != 0 && millis() > motorTimer) {
+        // 如果电机低电平，打开电机
+        if (digitalRead(MOTOR_PIN) == LOW) {
+            digitalWrite(MOTOR_PIN, HIGH);
+            // 如果电机高电平，到达了震动时长，计时器清零并关闭电机
+        } else if (digitalRead(MOTOR_PIN) == HIGH && millis() - motorTimer > MOTOR_TIMEOUT) {
+            digitalWrite(MOTOR_PIN, LOW);
+            motorTimer = 0;
+        }
+    }
+}
+
+// 处理LED
+void ledHandler() {
+    // 判断计时器有值
+    if (ledTimer != 0 && millis() > ledTimer) {
+        // 逐渐点亮特效
+        if (ledEffect == INCREASE_UP) {
+            // 设置led亮度为默认
+            strip.setBrightness(LED_BRIGHT);
+
+            // 判断灯珠位置
+            if (ledCount < strip.numPixels()) {
+                // 判断点亮时间
+                if (millis() > ledTimer + ledCount * INCREASE_UP_TIMEOUT) {
+                    strip.setPixelColor(ledCount, ICE_BLUE);
+                    strip.show();
+                    ledCount++;
+                }
+            } else {
+                ledTimer = 0;
+                // ledEffect = LED_ON;
             }
-            if (thrustTriggered) {
+        }
+
+        // 增加亮度特效
+        if (ledEffect == BRIGHTNESS) {
+            // 判断增加亮度超时时间
+            if (millis() < ledTimer + BRIGHTNESS_TIMEOUT) {
+                Serial.println("led Brightness");
+                strip.setBrightness(150);
+                strip.show();
+            } else {
+                strip.setBrightness(LED_BRIGHT);
+                strip.show();
+                ledTimer = 0;
             }
+        }
+
+    } else if (ledTimer == 0) {
+        // 常亮
+        if (ledEffect == LED_ON) {
+            strip.setBrightness(LED_BRIGHT);
+            strip.show();
+        }
+
+        // 关闭
+        if (ledEffect == LED_OFF) {
+            /* code */
+        }
+
+        // 炫彩
+        if (ledEffect == COLORFUL) {
+            // hue += 2;
+            // if (hue >= 256) {
+            //     hue = 0;  // 当色调值达到最大值时重置为0
+            // }
+            // for (int i = 0; i < strip.numPixels(); i++) {
+            //     strip.setPixelColor(i, strip.gamma32(strip.ColorHSV(hue)));
+            // }
+            // strip.show();
+            // delay(50); // 每次循环之间等待50毫秒
+        }
+
+        // strip.setBrightness(LED_BRIGHT);
+        // strip.show();
+    }
+}
+
+// 打印大师剑状态
+void printStatus() {
+    switch (swordStatus) {
+        case STATUS_INIT:
+            Serial.println("STATUS_INIT");
+            break;
+        case STATUS_NORMAL:
+            Serial.println("STATUS_NORMAL");
+            break;
+        case STATUS_FIGHT:
+            Serial.println("STATUS_FIGHT");
+            break;
+        case STATUS_DISPLAY:
+            Serial.println("STATUS_DISPLAY");
             break;
         default:
-            // 默认状态或空闲状态 - 保持不变
             break;
     }
-    normalTriggered = false;
-    fightTriggered = false;
-    swingTriggered = false;
-    thrustTriggered = false;
 }
 
-void setLEDColor(uint8_t r, uint8_t g, uint8_t b) {
-    for (int i = 0; i < strip.numPixels(); i++) {
-        strip.setPixelColor(i, r, g, b);
+// 打印触发器状态
+void printTrigger() {
+    switch (triggerState) {
+        case TRIG_CLICK:
+            Serial.println("TRIG_CLICK");
+            break;
+        case TRIG_DBCLCK:
+            Serial.println("TRIG_DBCLCK");
+            break;
+        case TRIG_PRESS:
+            Serial.println("TRIG_PRESS");
+            break;
+        case TRIG_SWING:
+            Serial.println("TRIG_SWING");
+            break;
+        case TRIG_IDLE:
+            Serial.println("TRIG_IDLE");
+            break;
+        default:
+            break;
     }
-    strip.show();
 }
 
-void triggerMotor() {
-    digitalWrite(MOTOR_PIN, HIGH);
-    delay(500);
-    digitalWrite(MOTOR_PIN, LOW);
-}
+// 打印加速度值
+void printAccelData(float prev[], float current[]) {
+    Serial.print("prevAccel: X: ");
+    Serial.print(prev[0]);
+    Serial.print("  Y: ");
+    Serial.print(prev[1]);
+    Serial.print("  Z: ");
+    Serial.print(prev[2]);
+    Serial.println(" m/s^2");
 
-void adjustBrightnessForSwing() {
-    // 临时增加亮度，然后恢复原状
-    strip.setBrightness(255);
-    strip.show();
-    delay(500);               // 亮0.5秒
-    strip.setBrightness(50);  // 恢复原来的亮度
-    strip.show();
+    Serial.print("currAccel: X: ");
+    Serial.print(current[0]);
+    Serial.print("  Y: ");
+    Serial.print(current[1]);
+    Serial.print("  Z: ");
+    Serial.print(current[2]);
+    Serial.println(" m/s^2");
 }
-
 // // 线程1 独立控制音频播放，避免因delay而产生的音频播放错误
 // void task_musicplay(void* pvParameters) {
 //     while (1) {
@@ -367,45 +584,3 @@ void adjustBrightnessForSwing() {
 // }
 
 // void task_sens(void* pvParameters) {
-//
-// 大师剑灯光的几种状态  只有完成了动作之后，才能触发其他状态
-// 开机状态，0.5秒内震动2次，缓慢逐渐点亮剑身至全量为冰蓝色，同时播放001.wav音频
-// 通常状态，剑身冰蓝色
-// 战斗状态，剑身红色
-// 空闲状态，表示音频或者效果触发结束
-
-// 顺时针扭转触发器，在通常状态，顺时针扭转剑身，剑身变为红色，状态变为战斗状态，0.5秒内震动1次，同时播放002.wav音频
-// 逆时针扭转触发器，在战斗状态，逆时针扭转剑身，剑身变为冰蓝色，状态变为战斗状态，0.5秒内震动1次，同时播放003.wav音频
-// 挥动触发器，剑身变亮0.5秒之后返回原来亮度
-// 前刺触发器，在原有状态颜色的基础上，增加1条极光色的追踪效果，追踪方向从第一个灯珠移动到结尾，保持4个led长度不变，同时播放004.wav音频
-
-// 本代码为基于platformio的esp32s3通过arduino平台制作的塞尔达大师光剑
-// 本项目通过adxl345检测加速度 ，I2S MAX98357数字功放模块 播放音频,52颗ws2812灯带作为光剑效果，并使用GPIO通过mos管控制微型震动马达
-// [env:esp32-s3-devkitc-1]
-// platform = espressif32
-// board = esp32-s3-devkitc-1
-// framework = arduino
-// board_build.filesystem = littlefs
-// board_build.arduino.partitions = ./default_16MB.csv
-// board_build.arduino.memory_type = qio_opi
-// build_flags =
-// 	-DBOARD_HAS_PSRAM
-// 	-DARDUINO_USB_CDC_ON_BOOT=1
-// board_upload.flash_size = 16MB
-// monitor_speed = 115200
-// lib_deps =
-// 	adafruit/Adafruit NeoPixel@^1.12.2
-// 	adafruit/Adafruit Unified Sensor@^1.1.14
-// 	adafruit/Adafruit ADXL345@^1.3.4
-// 	briand/LibBriandIDF@^1.5.0
-// 	esphome/ESP32-audioI2S@^2.0.7
-// 需求如下
-// 大师剑灯光的几种状态  只有完成了动作之后，才能触发其他状态
-// 开机状态，0.5秒内震动2次，缓慢逐渐点亮剑身至全量为冰蓝色
-// 通常状态，剑身冰蓝色
-// 战斗状态，剑身红色
-// 空闲状态，表示音频或者效果触发结束
-// 顺时针扭转触发器，在通常状态，顺时针扭转剑身，剑身变为红色，状态变为战斗状态，0.5秒内震动1次
-// 逆时针扭转触发器，在战斗状态，逆时针扭转剑身，剑身变为冰蓝色，状态变为战斗状态，0.5秒内震动1次
-// 挥动触发器，剑身变亮0.5秒之后返回原来亮度
-// 前刺触发器，在原有状态颜色的基础上，增加1条极光色的追踪效果，追踪方向从第一个灯珠移动到结尾，保持4个led长度不变
