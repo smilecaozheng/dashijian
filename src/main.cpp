@@ -7,251 +7,543 @@
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <Wire.h>
-#include <esp_task_wdt.h>
+#include <esp_heap_caps.h> // ESP-IDF 提供的头文件 
+#include <esp_task_wdt.h>  // 使用任务看门狗库
 
 #define DEBUG 1  // DEBUG模式
 
-// WS2812灯带实例化
-#define LED_PIN 41
-#define LED_COUNT 52
-#define LED_BRIGHT 50
-
 // 功能按钮
 #define BUTTON_PIN 18
-
-// 预定颜色定义
-#define ICE_BLUE (0x00FFFFFF)       // 冰蓝色
-#define GOLDEN (0xFFD700FF)         // 金色
-#define TIFFANY_GREEN (0x009999FF)  // 蒂芙尼绿色
-#define RED (0xFF0000FF)            // 红色
-
-// 大师剑的几种状态
 
 // 触发器的几种状态
 enum TriggerState {
     TRIG_CLICK,   // 单击
     TRIG_DBCLCK,  // 双击
     TRIG_PRESS,   // 长按
+    TRIG_SWING,   // 挥动
+    TRIG_SLEEP,   // 休眠状态
     TRIG_IDLE     // 空闲状态
 };
 
-// LED的几种效果
-enum LedEffect {
-    LED_OFF,      // 熄灭
-    INCREASE_UP,  // 逐渐点亮
-    BRIGHTNESS,   // 闪耀
-    COLORFUL      // 炫彩
+// 按键全局变量
+TriggerState triggerState = TRIG_IDLE;        // 初始状态为空闲
+unsigned long lastPressTime = 0;              // 上次长按时间
+unsigned long lastReleaseTime = 0;            // 上次按键释放时间
+unsigned long lastActionTime = 0;             // 上次动作时间
+bool buttonState = false;                     // 按键状态，低电平：1 ，高电平：0
+bool lastButtonState = false;                 // 上次按键状态
+bool waitingForDoubleClick = false;           // 等待双击标志
+bool longPressTriggered = false;              // 长按触发标志
+bool sleepTriggered = false;                  // 睡眠触发标志
+const unsigned long DOUBLE_CLICK_TIME = 500;  // 双击间隔时间 (毫秒)
+const unsigned long LONG_PRESS_TIME = 2000;   // 长按时间 (毫秒)
+const unsigned long SLEEP_TIME = 10000;       // 休眠时间 (毫秒)
+
+// ADXL345加速度传感器
+#define I2C_ADXL345_SCL 36
+#define I2C_ADXL345_SDA 37
+
+// 加速度传感器全局变量
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);  // 加速度传感器对象
+sensors_event_t accel_event;                                       // 加速度传感器事件
+static float prevAccel[3] = {0.0f, 0.0f, 0.0f};                    // 当前加速度值
+static float currAccel[3] = {0.0f, 0.0f, 0.0f};                    // 上一次加速度值
+const float FILTER_ALPHA = 0.1f;        // 平滑加速度数据的滤波器系数
+const float SWING_THRESHOLD = 1.0f;     // 挥动动作的阈值 忽略XYZ 关注加速度变化
+const unsigned long SWING_TIME = 2000;  // 挥动消抖时间 (毫秒)
+
+// 大师剑的几种状态
+enum SwordStatus {
+    STATUS_INIT,    // 开机状态 剑身不亮，单击触发震动，逐渐点亮蓝色剑身，并播放001.wav 之后进入通常状态，闲时超过60秒进入展示状态
+    STATUS_NORMAL,  // 通常状态 剑身蓝色，挥动触发特效，双击更改挥动特效，长按进入战斗状态，触发震动，并播放002.wav
+    STATUS_FIGHT,   // 战斗状态 剑身红色，挥动触发特效，双击更改挥动特效，单击返回普通模式，触发震动，并播放003.wav
+    STATUS_DISPLAY  // 展示状态 剑身炫彩，双击拾音灯功能，单击返回普通状态，触发震动，并播放003.wav
 };
 
-// 实例对象
-Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);  // WS2812灯带对象
+// 全局变量大师剑状态
+volatile SwordStatus swordStatus = STATUS_INIT;      // 大师剑状态
+volatile SwordStatus lastSwordStatus = STATUS_INIT;  // 上一次大师剑状态
 
-// 全局变量
-volatile TriggerState triggerState = TRIG_IDLE;  // 触发器
-volatile LedEffect ledEffect = LED_OFF;          // LED效果
+// WS2812灯带实例化
+#define LED_PIN 41
+#define LED_COUNT 52
+#define LED_BRIGHT 50
 
-// 按键参数
-volatile boolean buttonPressed = false;          // 按键按下
-volatile boolean buttonReleased = false;         // 按键释放
-volatile boolean longPress = false;              // 按键长按
-volatile boolean doubleClicked = false;          // 按键双击
-static unsigned long lastButtonTime = 0;         // 上次按键时间
-volatile int buttonLevel = 0;                    // 按键电平
-volatile int clickCount = 0;                     // 按键计数器
-const unsigned long BUTTON_TIMEOUT = 50;         // 按键超时时间 (毫秒)
-const unsigned long DOUBLE_CLICK_TIMEOUT = 300;  // 双击超时时间 (毫秒)
-const unsigned long PRESS_TIMEOUT = 1000;        // 长按超时时间 (毫秒)
+// 定义颜色
+#define ICE_BLUE 0, 255, 255       // 冰蓝色
+#define GOLDEN 255, 215, 0         // 金色
+#define TIFFANY_GREEN 0, 153, 153  // 蒂芙尼绿色
+#define RED 255, 0, 0              // 红色
+#define OFF 0, 0, 0                // 不亮
 
-// 动作开始计时器
-static unsigned long ledTimer = 0;   // LED效果开始时间
-static unsigned long idleTimer = 0;  // 闲时计时开始时间
+// LED的几种效果
+enum LedEffect {
+    LED_OFF,        // 熄灭
+    INCREASE_UP,    // 逐渐点亮
+    FIGHT_IN,       // 进入战斗
+    RETURN_NORMAL,  // 返回普通
+    RETURN_LAST,    // 换回上一次效果
+    BRIGHTNESS,     // 闪耀
+    COLORFUL,       // 炫彩
+    LED_ON,         // 熄灭
+    EFFECT_DONE     // 效果切换完成
 
-// 上次检测时间
-static unsigned long lastClickTime = 0;  // 上次单击时间
+};
 
-// 计数器
-volatile int ledCount = 0;  // led计数器
+// 全局变量LED灯
+Adafruit_NeoPixel strip = Adafruit_NeoPixel(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);  // WS2812灯带对象
+volatile LedEffect ledEffect = LED_OFF;                                                 // LED效果
+volatile int ledCount = 0;                                                              // led计数器
+unsigned long lastLedCountTime = 0;                                                     // 上次led计数时间
+volatile int hueCount = 0;                                                              // hue计数器
+unsigned long lastHueTime = 0;                                                          // 上次hue变化时间
+unsigned long brightEndTime = 0;                                                        // 闪耀结束时间
+const unsigned long INCREASE_UP_TIME = 30;                                              // 逐渐点亮延时时间 (毫秒)
+const unsigned long HUE_UPDATE_TIME = 20;                                               // 炫彩变换延时时间 (毫秒)
+const unsigned long BRIGHTNESS_TIME = 500;                                              // 闪耀特效超时时间 (毫秒)
 
-// 状态冷却时间（毫秒）
+// 微型震动马达
+#define MOTOR_PIN 1  // 震动马达mos栅极
 
-const unsigned long IDLE_TIMEOUT = 60000;      // 闲时超时时间 (毫秒)
-const unsigned long BRIGHTNESS_TIMEOUT = 500;  // 闪耀特效超时时间 (毫秒)
-// LED延时时间（毫秒）
-const unsigned long INCREASE_UP_TIMEOUT = 30;  // 逐渐点亮延时时间 (毫秒)
+unsigned long motorEndTime = 0;        // 震动结束时间
+const unsigned long MOTOR_TIME = 300;  // 震动超时时间 (毫秒)
+
+// MAX98357数字功放模块参数
+#define I2S_MAX98357_DOUT 11
+#define I2S_MAX98357_BCLK 12
+#define I2S_MAX98357_LRC 13
+
+Audio audio;
+unsigned long audioStartTime = 0;             // 音频开始时间
+const unsigned long AUDIO_DELAY_TIME = 1000;  // 延时播放时间 (毫秒)
+
+int audioNumber = 0;  // 音频No
+const char* music_list[] = {
+    "/", "/001.mp3", "/002.mp3", "/003.mp3"};
 
 // 函数声明
 void detectButtons();
-
+void detectADXL();
 void judgeActions();
-
 void ledHandler();
-
-void printTrigger();
+void motorHandler();
+void audioHandler();
+void setTriggerState(TriggerState state);
+void setSwordStatus(SwordStatus swordStatus);
+void setLedEffect(LedEffect ledEffect);
+void printAccelData(float prev[], float current[]);
 
 void setup() {
     // 开启串口debug输出
     Serial.begin(115200);
     Serial.setDebugOutput(true);
-    delay(5000);
-    Serial.println("Setup started");
 
-    // 初始化WS2812
-    strip.begin();
-    strip.setBrightness(0);
-    strip.show();  // 关闭所有灯
-    delay(200);
+    delay(2000);
+    Serial.println("Serial started");
 
-    // 初始化功能按钮
+    // 禁用看门狗定时器
+    // esp_task_wdt_init(0, true); // 禁用看门狗
+    // esp_task_wdt_delete(NULL);  // 删除看门狗任务
+
+    Serial.printf("Deafult free size: %d\n", heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+    Serial.printf("PSRAM free size: %d\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    Serial.printf("Flash size: %d bytes\n", ESP.getFlashChipSize());
+
+    // 初始化按键
+    Serial.println("Initializing Button");
     pinMode(BUTTON_PIN, INPUT_PULLUP);
+    lastActionTime = millis();
 
-    // 打印触发器状态
-    printTrigger();
+    // 初始化ADXL
+    Serial.println("Initializing I2C");
+    delay(100);  // 添加延时
+    Wire.begin(I2C_ADXL345_SDA, I2C_ADXL345_SCL);
+    if (!accel.begin()) {
+        Serial.println("Ooops, no ADXL345 detected ... Check your wiring!");
+        while (1);
+    }
+    accel.setRange(ADXL345_RANGE_16_G);  // 设置ADXL 量程
+
+    // 初始化LED
+    Serial.println("Initializing WS2812");
+    strip.begin();
+    strip.show();  // 初始化所有像素为'off'
+    lastLedCountTime = millis();
+
+    // 初始化震动马达
+    Serial.println("Initializing Motor");
+    pinMode(MOTOR_PIN, OUTPUT);
+
+    // 初始化LittleFS
+    Serial.println("Initializing LittleFS");
+    if (!LittleFS.begin()) {
+        Serial.println("LittleFS mount failed");
+        return;
+    }
+
+    // // 初始化I2S MAX98357数字功放模块参数
+    // Serial.println("Initializing I2S audio module");
+    // if (!audio.setPinout(I2S_MAX98357_BCLK, I2S_MAX98357_LRC, I2S_MAX98357_DOUT)) {
+    //     Serial.println("Failed to initialize I2S pins");
+    //     return;
+    // }
+    // audio.setBufsize(0, 1 * 1024 * 1024);  // 0表示使用PSRAM
+    // audio.setVolume(21);                   // 音量范围0...21
+    // Serial.println("Connecting to /001.mp3");
+    // if (!audio.connecttoFS(LittleFS, music_list[1])) {
+    //     Serial.println("Failed to connect to /001.mp3");
+    //     return;  // 如果音频连接失败，退出setup
+    // }
+    // audio.setFileLoop(1);
+
+    // Serial.println("Setup complete");
 }
 
 void loop() {
-    // 喂看门狗定时器
-    esp_task_wdt_reset();
 
-    // 检测功能按键
-    detectButtons();
-
-    // 根据状态更新LED灯带和执行其他逻辑
-    judgeActions();
-
-    // 处理LED
-    ledHandler();
+    // audio.loop();  // 音频循环
+    detectButtons();  // 检测按键
+    detectADXL();     // 检测加速度传感器
+    judgeActions();   // 判断动作
+    ledHandler();     // 处理LED
+    motorHandler();   // 处理震动马达
+    // audioHandler();   // 处理音频
 }
 
-// 检测功能按键
+// 检测按键
 void detectButtons() {
-    // 读取按键电平
-    buttonLevel = digitalRead(BUTTON_PIN);
+    // 记录当前时间
+    unsigned long currentTime = millis();
 
-    // 消抖处理
-    if (buttonLevel != buttonPressed) {
-        lastButtonTime = millis();
-    }
+    // 判断按键状态，低电平：1 ，高电平：0
+    buttonState = digitalRead(BUTTON_PIN) == LOW;
 
-    // 如果过了冷却时间
-    if ((millis() - lastButtonTime) > BUTTON_TIMEOUT) {
-        // 如果按键被按下
-        if (buttonLevel == LOW && !buttonPressed) {
-            buttonPressed = true;
-            buttonReleased = false;
-            clickCount = 1;
-            lastClickTime = millis();
-        }
-        // 如果按键被释放
-        else if (buttonLevel == HIGH && buttonPressed) {
-            buttonPressed = false;
-            buttonReleased = true;
+    // 检查按钮状态
+    if (buttonState != lastButtonState) {
+        // 按键按下
+        if (buttonState) {
+            lastPressTime = currentTime;  // 更新上次动作时间
+            longPressTriggered = false;   // 按下按钮时重置长按标志
 
-            // 检查是否为长按
-            if (millis() - lastClickTime > PRESS_TIMEOUT) {
-                longPress = true;
-                buttonReleased = false;  // 清除释放标志，防止长按时误触发单击
-            }
-            // 检查是否为双击
-            else if (clickCount == 1 && (millis() - lastClickTime) < DOUBLE_CLICK_TIMEOUT) {
-                // 等待第二次点击
-                clickCount = 2;  // 标记为第二次点击
+            // 按键松开
+        } else {
+            lastReleaseTime = currentTime;  // 更新上次动作时间
+
+            // 判断等待双击标志
+            if (waitingForDoubleClick) {
+                // 判断双击条件
+                if (currentTime - lastReleaseTime < DOUBLE_CLICK_TIME && !longPressTriggered) {
+                    setTriggerState(TRIG_DBCLCK);   // 设置状态：双击
+                    waitingForDoubleClick = false;  // 重置等待双击标志
+                }
             } else {
-                clickCount = 0;
+                //  防止长按后检测到单击或双击
+                if (!longPressTriggered) {
+                    waitingForDoubleClick = true;  // 重置等待双击标志
+                    lastActionTime = currentTime;  // 更新上次动作时间
+                }
+            }
+            // 如果长按已触发，松开时不检测单击
+            if (longPressTriggered) {
+                waitingForDoubleClick = false;  // 重置等待双击标志
             }
         }
+        lastButtonState = buttonState;  // 更新上次按键状态
     }
 
-    // 检查是否为单击
-    if (buttonReleased && !longPress && clickCount == 1) {
-        // 确保从上次点击到现在的时间超过双击超时时间
-        if (millis() - lastClickTime >= DOUBLE_CLICK_TIMEOUT) {
-            triggerState = TRIG_CLICK;  // 触发单击
+    // 长按检测
+    if (buttonState && (currentTime - lastPressTime > LONG_PRESS_TIME) && !longPressTriggered) {
+        setTriggerState(TRIG_PRESS);    // 设置状态：长按
+        longPressTriggered = true;      // 触发长按
+        waitingForDoubleClick = false;  // 重置等待双击标志
+        lastActionTime = currentTime;   // 更新上次动作时间 防止进入睡眠
+    }
 
-            printTrigger();
-            buttonReleased = false;  // 重置释放标志
-            clickCount = 0;          // 清除点击计数
+    // 睡眠检测
+    if (!buttonState && (currentTime - lastActionTime > SLEEP_TIME) && !sleepTriggered) {
+        setTriggerState(TRIG_SLEEP);   // 设置状态：睡眠
+        sleepTriggered = true;         // 触发睡眠
+        lastActionTime = currentTime;  // 更新上次动作时间 防止进入睡眠
+    }
+
+    // 单击检测
+    if (waitingForDoubleClick && (currentTime - lastReleaseTime > DOUBLE_CLICK_TIME)) {
+        setTriggerState(TRIG_CLICK);    // 设置状态：单击
+        waitingForDoubleClick = false;  // 重置等待双击标志 防止单击后检测到双击
+        lastActionTime = currentTime;   // 更新 lastActionTime 防止进入睡眠
+    }
+
+    // 如果有按键触发，则不触发睡眠状态
+    if (buttonState || waitingForDoubleClick || longPressTriggered) {
+        sleepTriggered = false;  // 重置睡眠标志
+    }
+
+    // 进入睡眠状态后重置活动时间，防止反复触发
+    if (triggerState == TRIG_SLEEP) {
+        lastActionTime = currentTime;  // 更新上次动作时间
+    }
+
+    // 闲置检测
+    if (!buttonState && !waitingForDoubleClick && !longPressTriggered && !sleepTriggered) {
+        // setTriggerState(TRIG_IDLE);  // 设置状态：空闲
+    }
+}
+
+// 检测加速度
+void detectADXL() {
+    // 记录当前时间
+    unsigned long currentTime = millis();
+
+    // 如果开机状态 或者任意计时器有值则 不检测加速度
+    // if (swordStatus == STATUS_INIT || motorTimer != 0 || audioTimer != 0 || ledTimer != 0)
+    //     return;
+
+    // 非空闲状态，开机状态，展示状态，跳出检测
+    if (triggerState == TRIG_CLICK || triggerState == TRIG_PRESS || triggerState == TRIG_DBCLCK || swordStatus == STATUS_INIT)
+        return;
+
+    // 取得加速度
+    accel.getEvent(&accel_event);
+
+    // 判断挥动冷却时间
+    if (currentTime - lastActionTime > SWING_TIME) {
+        // 平滑加速度数据
+        currAccel[0] = FILTER_ALPHA * accel_event.acceleration.x + (1 - FILTER_ALPHA) * prevAccel[0];
+        currAccel[1] = FILTER_ALPHA * accel_event.acceleration.y + (1 - FILTER_ALPHA) * prevAccel[1];
+        currAccel[2] = FILTER_ALPHA * accel_event.acceleration.z + (1 - FILTER_ALPHA) * prevAccel[2];
+
+        // 检查XYZ轴的总体变化
+        if ((fabs(currAccel[0] - prevAccel[0]) > SWING_THRESHOLD) ||
+            (fabs(currAccel[1] - prevAccel[1]) > SWING_THRESHOLD) ||
+            (fabs(currAccel[2] - prevAccel[2]) > SWING_THRESHOLD)) {
+            // 触发挥动
+            setTriggerState(TRIG_SWING);  // 设置状态：挥动
+
+            // 更新挥动的最后时间
+            lastActionTime = currentTime;  // 更新 lastActionTime 防止进入睡眠
+
+            // 打印大师剑和触发器状态，触发时间，加速度参数
+            printAccelData(prevAccel, currAccel);
         }
     }
 
-    // 检查是否为双击
-    if (buttonReleased && !longPress && clickCount == 2) {
-        triggerState = TRIG_DBCLCK;  // 触发双击
+    // 更新上一次加速度值
+    prevAccel[0] = accel_event.acceleration.x;
+    prevAccel[1] = accel_event.acceleration.y;
+    prevAccel[2] = accel_event.acceleration.z;
+}
 
-        printTrigger();
-        buttonReleased = false;  // 重置释放标志
-        clickCount = 0;          // 清除点击计数
-    }
-    // 检查是否为长按
-    if (longPress) {
-        triggerState = TRIG_PRESS;  // 触发长按
-        printTrigger();
-        longPress = false;          // 重置长按标志
-        buttonReleased = false;     // 清除释放标志，防止长按时误触发单击
+// 判断动作
+void judgeActions() {
+    // 开机状态
+    if (swordStatus == STATUS_INIT) {
+        // 长按
+        if (triggerState == TRIG_PRESS) {
+            motorEndTime = millis() + MOTOR_TIME;          // 指定电机结束震动时间
+            audioStartTime = millis() + AUDIO_DELAY_TIME;  // 指定音频播放开始时间
+            audioNumber = 1;                               // 指定播放音频
+            setLedEffect(INCREASE_UP);                     // 开机处理
+            setSwordStatus(STATUS_NORMAL);                 // 进入普通状态
+
+            // 睡眠
+        } else if (triggerState == TRIG_SLEEP) {
+            lastSwordStatus = swordStatus;   // 记录上一次状态
+            setLedEffect(COLORFUL);          // 渐变炫彩
+            setSwordStatus(STATUS_DISPLAY);  // 进入展示状态
+        }
+
+        // 普通状态
+    } else if (swordStatus == STATUS_NORMAL && ledEffect == EFFECT_DONE) {
+        // 长按
+        if (triggerState == TRIG_PRESS) {
+            audioStartTime = millis() + AUDIO_DELAY_TIME;  // 指定音频播放开始时间
+            audioNumber = 2;                               // 指定播放音频
+            motorEndTime = millis() + MOTOR_TIME;          // 指定电机结束震动时间
+            setLedEffect(FIGHT_IN);                        // 进入战斗
+            setSwordStatus(STATUS_FIGHT);                  // 进入战斗状态
+
+            // 双击
+        } else if (triggerState == TRIG_DBCLCK) {
+            // 切换挥动效果
+
+            // 单击
+        } else if (triggerState == TRIG_CLICK) {
+            // 熄灭处理
+            setLedEffect(LED_OFF);        // 关灯
+            setSwordStatus(STATUS_INIT);  // 返回开机状态
+
+            // 挥动
+        } else if (triggerState == TRIG_SWING) {
+            // 变亮特效
+            setLedEffect(BRIGHTNESS);  // 关灯
+
+            // 睡眠
+        } else if (triggerState == TRIG_SLEEP) {
+            lastSwordStatus = swordStatus;   // 记录上一次状态
+            setLedEffect(COLORFUL);          // 渐变炫彩
+            setSwordStatus(STATUS_DISPLAY);  // 进入展示状态
+        }
+
+        // 战斗状态
+    } else if (swordStatus == STATUS_FIGHT && ledEffect == EFFECT_DONE) {
+        // 单击
+        if (triggerState == TRIG_CLICK) {
+            audioStartTime = millis() + AUDIO_DELAY_TIME;  // 指定音频播放开始时间
+            audioNumber = 3;                               // 指定播放音频
+            setLedEffect(RETURN_NORMAL);                   // 返回普通
+            setSwordStatus(STATUS_NORMAL);                 // 返回正常状态
+
+            // 双击
+        } else if (triggerState == TRIG_DBCLCK) {
+            // 切换挥动效果
+
+            // 挥动
+        } else if (triggerState == TRIG_SWING) {
+            setLedEffect(BRIGHTNESS);  // 变亮特效
+            // 睡眠
+        } else if (triggerState == TRIG_SLEEP) {
+            lastSwordStatus = swordStatus;   // 记录上一次状态
+            setLedEffect(COLORFUL);          // 渐变炫彩
+            setSwordStatus(STATUS_DISPLAY);  // 进入展示状态
+        }
+
+        // 展示状态
+    } else if (swordStatus == STATUS_DISPLAY) {
+        // 双击
+        if (triggerState == TRIG_DBCLCK) {
+            // 切换拾音灯 模式
+
+        } else if (triggerState != TRIG_SLEEP) {
+            setLedEffect(RETURN_LAST);        // 返回上一次效果
+            setSwordStatus(lastSwordStatus);  // 返回上一次状态
+        }
     }
 }
 
 // 处理LED
 void ledHandler() {
-    switch (ledEffect) {
-        case LED_OFF:
-            // 灯熄灭
-            strip.setBrightness(0);
+    // 记录当前时间
+    unsigned long currentTime = millis();
+
+    if (ledEffect == LED_OFF) {
+        if (ledCount < strip.numPixels() && (currentTime - lastLedCountTime > INCREASE_UP_TIME)) {
+            strip.setPixelColor(strip.numPixels() - ledCount - 1, OFF);  // 不亮
+            ledCount++;
+            lastLedCountTime = currentTime;
             strip.show();
-            break;
-        case INCREASE_UP:
-            if (ledCount < LED_COUNT) {
-                strip.setPixelColor(ledCount++, ICE_BLUE);  // 冰蓝色
-                strip.show();
-                delay(INCREASE_UP_TIMEOUT);
-            } else {
-                strip.fill(ICE_BLUE, 0, LED_COUNT);
-                strip.show();
-                ledEffect = LED_OFF;
-            }
-            break;
-        case BRIGHTNESS:
+        }
+    }
+
+    if (ledEffect == INCREASE_UP) {
+        if (ledCount < strip.numPixels() && (currentTime - lastLedCountTime > INCREASE_UP_TIME)) {
             strip.setBrightness(LED_BRIGHT);
+            strip.setPixelColor(ledCount, ICE_BLUE);  // 冰蓝色
+            ledCount++;
+            lastLedCountTime = currentTime;
             strip.show();
-            delay(BRIGHTNESS_TIMEOUT);
-            ledEffect = LED_OFF;
-            break;
-        case COLORFUL:
-            // 炫彩效果
-            // 这里可以添加炫彩效果的代码
-            break;
-        default:
-            break;
+            Serial.println(ledCount);
+        } else if (ledCount >= strip.numPixels()) {
+            setLedEffect(EFFECT_DONE);   // 效果完成
+            setTriggerState(TRIG_IDLE);  // 触发完成
+        }
+    }
+
+    if (ledEffect == FIGHT_IN) {
+        if (ledCount < strip.numPixels() && (currentTime - lastLedCountTime > INCREASE_UP_TIME)) {
+            strip.setPixelColor(ledCount, GOLDEN);  // 金色
+            ledCount++;
+            lastLedCountTime = currentTime;
+            strip.show();
+            Serial.println(ledCount);
+        } else if (ledCount >= strip.numPixels()) {
+            setLedEffect(EFFECT_DONE);   // 效果完成
+            setTriggerState(TRIG_IDLE);  // 触发完成
+        }
+    }
+
+    if (ledEffect == RETURN_NORMAL) {
+        if (ledCount < strip.numPixels() && (currentTime - lastLedCountTime > INCREASE_UP_TIME)) {
+            strip.setPixelColor(strip.numPixels() - ledCount - 1, ICE_BLUE);  // 不亮
+            ledCount++;
+            lastLedCountTime = currentTime;
+            strip.show();
+        } else if (ledCount >= strip.numPixels()) {
+            setLedEffect(EFFECT_DONE);   // 效果完成
+            setTriggerState(TRIG_IDLE);  // 触发完成
+        }
+    }
+
+    if (ledEffect == BRIGHTNESS) {
+        if (currentTime < brightEndTime) {
+            strip.setBrightness(100);
+            strip.show();
+        } else {
+            strip.setBrightness(LED_BRIGHT);  // 恢复亮度
+            strip.show();
+            setLedEffect(EFFECT_DONE);   // 效果完成
+            setTriggerState(TRIG_IDLE);  // 触发完成
+        }
+    }
+
+    if (ledEffect == COLORFUL) {
+        strip.setBrightness(LED_BRIGHT);  // 恢复亮度
+        if (hueCount < 256 * 5 && (currentTime - lastHueTime > HUE_UPDATE_TIME)) {
+            for (ledCount; ledCount < strip.numPixels(); ledCount++) {
+                uint16_t hue = (ledCount * 65536L / strip.numPixels()) - (hueCount * 256);
+                strip.setPixelColor(ledCount, strip.gamma32(strip.ColorHSV(hue)));
+            }
+            strip.show();
+            ledCount = 0;
+            hueCount++;
+            lastHueTime = currentTime;
+        } else if (hueCount >= 256 * 5) {
+            hueCount = 0;
+        }
+    }
+
+    if (ledEffect == RETURN_LAST) {
+        if (lastSwordStatus == STATUS_INIT) {
+            setLedEffect(LED_OFF);
+        } else if (lastSwordStatus == STATUS_NORMAL) {
+            setLedEffect(RETURN_NORMAL);
+        } else if (lastSwordStatus == STATUS_FIGHT) {
+            setLedEffect(FIGHT_IN);
+        }
     }
 }
 
-// 判断并设置LED的效果
-void judgeActions() {
-    if (triggerState == TRIG_CLICK) {
-        ledEffect = INCREASE_UP;
-        ledCount = 0;
-        ledTimer = millis();
-    } else if (triggerState == TRIG_DBCLCK) {
-        ledEffect = BRIGHTNESS;
-        ledTimer = millis();
-    } else if (triggerState == TRIG_PRESS) {
-        ledEffect = INCREASE_UP;
-        ledCount = 0;
-        for (int i = 0; i < LED_COUNT; i++) {
-            strip.setPixelColor(i, GOLDEN);  // 金色
-        }
-        ledTimer = millis();
-    } else if (triggerState == TRIG_IDLE) {
-        if (millis() - idleTimer > IDLE_TIMEOUT) {
-            ledEffect = COLORFUL;
-            idleTimer = millis();
-        }
+// 处理震动
+void motorHandler() {
+    // 记录当前时间
+    unsigned long currentTime = millis();
+    if (currentTime < motorEndTime && digitalRead(MOTOR_PIN) == LOW) {
+        digitalWrite(MOTOR_PIN, HIGH);
+        Serial.println("Motor vibration");
+    } else if (currentTime >= motorEndTime) {
+        digitalWrite(MOTOR_PIN, LOW);
     }
-    triggerState = TRIG_IDLE;
 }
 
-// 打印触发器状态
-void printTrigger() {
-    switch (triggerState) {
+// 处理音频
+void audioHandler() {
+    // 记录当前时间
+    unsigned long currentTime = millis();
+    int number;
+
+    if (currentTime < audioStartTime && audio.isRunning() == false && audioNumber != 0) {
+        number = audioNumber;
+        audioNumber = 0;
+        Serial.print("Connecting to ");
+        Serial.print(music_list[number]);
+        Serial.println(" to play audio...");
+        audio.connecttoFS(LittleFS, music_list[number]);  // 使用LittleFS和MP3文件路径进行连接
+    }
+}
+
+// 设置触发器
+void setTriggerState(TriggerState state) {
+    triggerState = state;
+    switch (state) {
         case TRIG_CLICK:
             Serial.println("TRIG_CLICK");
             break;
@@ -261,10 +553,102 @@ void printTrigger() {
         case TRIG_PRESS:
             Serial.println("TRIG_PRESS");
             break;
-        case TRIG_IDLE:
-            Serial.println("TRIG_IDLE");
+        case TRIG_SLEEP:
+            Serial.println("TRIG_SLEEP");
             break;
-        default:
+        case TRIG_SWING:
+            Serial.println("TRIG_SWING");
+            break;
+        case TRIG_IDLE:
             break;
     }
+}
+
+// 设置大师剑状态
+void setSwordStatus(SwordStatus status) {
+    swordStatus = status;
+    Serial.print("last status: ");
+    switch (lastSwordStatus) {
+        case STATUS_INIT:
+            Serial.print("STATUS_INIT");
+            break;
+        case STATUS_NORMAL:
+            Serial.print("STATUS_NORMAL");
+            break;
+        case STATUS_FIGHT:
+            Serial.print("STATUS_FIGHT");
+            break;
+        case STATUS_DISPLAY:
+            Serial.print("STATUS_DISPLAY");
+            break;
+    }
+    Serial.print("   ");
+    Serial.print("current status: ");
+    switch (swordStatus) {
+        case STATUS_INIT:
+            Serial.println("STATUS_INIT");
+            break;
+        case STATUS_NORMAL:
+            Serial.println("STATUS_NORMAL");
+            break;
+        case STATUS_FIGHT:
+            Serial.println("STATUS_FIGHT");
+            break;
+        case STATUS_DISPLAY:
+            Serial.println("STATUS_DISPLAY");
+            break;
+    }
+}
+
+// 设置LED效果
+void setLedEffect(LedEffect effect) {
+    ledCount = 0;
+    if (effect == BRIGHTNESS) brightEndTime = millis() + BRIGHTNESS_TIME;
+    ledEffect = effect;
+    Serial.print("current effect: ");
+    switch (ledEffect) {
+        case INCREASE_UP:
+            Serial.println("INCREASE_UP");
+            break;
+        case FIGHT_IN:
+            Serial.println("FIGHT_IN");
+            break;
+        case RETURN_NORMAL:
+            Serial.println("RETURN_NORMAL");
+            break;
+        case BRIGHTNESS:
+            Serial.println("BRIGHTNESS");
+            break;
+        case COLORFUL:
+            Serial.println("COLORFUL");
+            break;
+        case LED_OFF:
+            Serial.println("LED_OFF");
+            break;
+        case EFFECT_DONE:
+            Serial.println("EFFECT_DONE");
+            break;
+        case RETURN_LAST:
+            Serial.println("RETURN_LAST");
+            break;
+    }
+}
+
+// 打印加速度值
+void printAccelData(float prev[], float current[]) {
+    Serial.print("prevAccel: X: ");
+    Serial.print(prev[0]);
+    Serial.print("  Y: ");
+    Serial.print(prev[1]);
+    Serial.print("  Z: ");
+    Serial.print(prev[2]);
+    Serial.println(" m/s^2");
+
+    Serial.print("currAccel: X: ");
+    Serial.print(current[0]);
+    Serial.print("  Y: ");
+    Serial.print(current[1]);
+    Serial.print("  Z: ");
+    Serial.print(current[2]);
+    Serial.println(" m/s^2");
 }
