@@ -6,9 +6,9 @@
 #include <FS.h>
 #include <LittleFS.h>
 #include <Preferences.h>
-#include <Wire.h>
-#include <esp_heap_caps.h> // ESP-IDF 提供的头文件 
-#include <esp_task_wdt.h>  // 使用任务看门狗库
+#include <SPI.h>
+#include <esp_heap_caps.h>  // ESP-IDF 提供的头文件
+// #include <esp_task_wdt.h>  // 使用任务看门狗库
 
 #define DEBUG 1  // DEBUG模式
 
@@ -40,24 +40,27 @@ const unsigned long LONG_PRESS_TIME = 2000;   // 长按时间 (毫秒)
 const unsigned long SLEEP_TIME = 10000;       // 休眠时间 (毫秒)
 
 // ADXL345加速度传感器
-#define I2C_ADXL345_SCL 36
-#define I2C_ADXL345_SDA 37
+#define I2C_ADXL345_CS 40
+#define I2C_ADXL345_SCL 36   // SCK
+#define I2C_ADXL345_SDA 37   // MOSI
+#define I2C_ADXL345_MISO 39  // MISO
+// #define I2C_ADXL345_ADDR 0x53  // 0x1D if SDO = HIGH
 
 // 加速度传感器全局变量
-Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);  // 加速度传感器对象
-sensors_event_t accel_event;                                       // 加速度传感器事件
-static float prevAccel[3] = {0.0f, 0.0f, 0.0f};                    // 当前加速度值
-static float currAccel[3] = {0.0f, 0.0f, 0.0f};                    // 上一次加速度值
-const float FILTER_ALPHA = 0.1f;        // 平滑加速度数据的滤波器系数
-const float SWING_THRESHOLD = 1.0f;     // 挥动动作的阈值 忽略XYZ 关注加速度变化
-const unsigned long SWING_TIME = 2000;  // 挥动消抖时间 (毫秒)
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(I2C_ADXL345_SCL, I2C_ADXL345_MISO, I2C_ADXL345_SDA, I2C_ADXL345_CS, 12345);  // 加速度传感器对象
+sensors_event_t accel_event;                                                                                                           // 加速度传感器事件
+static float prevAccel[3] = {0.0f, 0.0f, 0.0f};                                                                                        // 当前加速度值
+static float currAccel[3] = {0.0f, 0.0f, 0.0f};                                                                                        // 上一次加速度值
+const float FILTER_ALPHA = 0.1f;                                                                                                       // 平滑加速度数据的滤波器系数
+const float SWING_THRESHOLD = 1.0f;                                                                                                    // 挥动动作的阈值 忽略XYZ 关注加速度变化
+const unsigned long SWING_TIME = 2000;                                                                                                 // 挥动消抖时间 (毫秒)
 
 // 大师剑的几种状态
 enum SwordStatus {
-    STATUS_INIT,    // 开机状态 剑身不亮，单击触发震动，逐渐点亮蓝色剑身，并播放001.wav 之后进入通常状态，闲时超过60秒进入展示状态
-    STATUS_NORMAL,  // 通常状态 剑身蓝色，挥动触发特效，双击更改挥动特效，长按进入战斗状态，触发震动，并播放002.wav
-    STATUS_FIGHT,   // 战斗状态 剑身红色，挥动触发特效，双击更改挥动特效，单击返回普通模式，触发震动，并播放003.wav
-    STATUS_DISPLAY  // 展示状态 剑身炫彩，双击拾音灯功能，单击返回普通状态，触发震动，并播放003.wav
+    STATUS_INIT,
+    STATUS_NORMAL,
+    STATUS_FIGHT,
+    STATUS_DISPLAY
 };
 
 // 全局变量大师剑状态
@@ -113,7 +116,7 @@ const unsigned long MOTOR_TIME = 300;  // 震动超时时间 (毫秒)
 #define I2S_MAX98357_BCLK 12
 #define I2S_MAX98357_LRC 13
 
-Audio audio;
+Audio audio = Audio(false, 3, I2S_NUM_1);
 unsigned long audioStartTime = 0;             // 音频开始时间
 const unsigned long AUDIO_DELAY_TIME = 1000;  // 延时播放时间 (毫秒)
 
@@ -132,7 +135,6 @@ void setTriggerState(TriggerState state);
 void setSwordStatus(SwordStatus swordStatus);
 void setLedEffect(LedEffect ledEffect);
 void printAccelData(float prev[], float current[]);
-
 void setup() {
     // 开启串口debug输出
     Serial.begin(115200);
@@ -140,10 +142,6 @@ void setup() {
 
     delay(2000);
     Serial.println("Serial started");
-
-    // 禁用看门狗定时器
-    // esp_task_wdt_init(0, true); // 禁用看门狗
-    // esp_task_wdt_delete(NULL);  // 删除看门狗任务
 
     Serial.printf("Deafult free size: %d\n", heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
     Serial.printf("PSRAM free size: %d\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -153,16 +151,6 @@ void setup() {
     Serial.println("Initializing Button");
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     lastActionTime = millis();
-
-    // 初始化ADXL
-    Serial.println("Initializing I2C");
-    delay(100);  // 添加延时
-    Wire.begin(I2C_ADXL345_SDA, I2C_ADXL345_SCL);
-    if (!accel.begin()) {
-        Serial.println("Ooops, no ADXL345 detected ... Check your wiring!");
-        while (1);
-    }
-    accel.setRange(ADXL345_RANGE_16_G);  // 设置ADXL 量程
 
     // 初始化LED
     Serial.println("Initializing WS2812");
@@ -174,6 +162,20 @@ void setup() {
     Serial.println("Initializing Motor");
     pinMode(MOTOR_PIN, OUTPUT);
 
+    // 初始化 SPI
+    SPI.begin(I2C_ADXL345_SCL, I2C_ADXL345_MISO, I2C_ADXL345_SDA, I2C_ADXL345_CS);
+
+    // 初始化ADXL
+    Serial.println("Initializing ADXL");
+    // Wire.begin(I2C_ADXL345_SDA, I2C_ADXL345_SCL, 100000);
+    if (!accel.begin()) {
+        Serial.println("Ooops, no ADXL345 detected ... Check your wiring!");
+        while (1);
+    }
+    accel.setRange(ADXL345_RANGE_16_G);  // 设置ADXL 量程
+
+    delay(2000);  // 添加延时
+
     // 初始化LittleFS
     Serial.println("Initializing LittleFS");
     if (!LittleFS.begin()) {
@@ -181,33 +183,34 @@ void setup() {
         return;
     }
 
-    // // 初始化I2S MAX98357数字功放模块参数
-    // Serial.println("Initializing I2S audio module");
-    // if (!audio.setPinout(I2S_MAX98357_BCLK, I2S_MAX98357_LRC, I2S_MAX98357_DOUT)) {
-    //     Serial.println("Failed to initialize I2S pins");
-    //     return;
-    // }
-    // audio.setBufsize(0, 1 * 1024 * 1024);  // 0表示使用PSRAM
-    // audio.setVolume(21);                   // 音量范围0...21
+    // 初始化I2S MAX98357数字功放模块参数
+    Serial.println("Initializing I2S audio module");
+    if (!audio.setPinout(I2S_MAX98357_BCLK, I2S_MAX98357_LRC, I2S_MAX98357_DOUT, I2S_GPIO_UNUSED)) {
+        Serial.println("Failed to initialize I2S pins");
+        return;
+    }
+    audio.setBufsize(0, 200 * 1024);  // 0表示使用PSRAM
+    audio.setVolume(21);              // 音量范围0...21
     // Serial.println("Connecting to /001.mp3");
-    // if (!audio.connecttoFS(LittleFS, music_list[1])) {
+    // if (!audio.connecttohost("http://downsc.chinaz.net/Files/DownLoad/sound1/201906/11582.mp3")) {
+    //     // if (!audio.connecttoFS(LittleFS, music_list[1])) {
     //     Serial.println("Failed to connect to /001.mp3");
     //     return;  // 如果音频连接失败，退出setup
     // }
     // audio.setFileLoop(1);
 
-    // Serial.println("Setup complete");
+    Serial.println("Setup complete");
 }
 
 void loop() {
-
     // audio.loop();  // 音频循环
+
     detectButtons();  // 检测按键
     detectADXL();     // 检测加速度传感器
     judgeActions();   // 判断动作
     ledHandler();     // 处理LED
     motorHandler();   // 处理震动马达
-    // audioHandler();   // 处理音频
+    audioHandler();   // 处理音频
 }
 
 // 检测按键
@@ -294,10 +297,6 @@ void detectADXL() {
     // 记录当前时间
     unsigned long currentTime = millis();
 
-    // 如果开机状态 或者任意计时器有值则 不检测加速度
-    // if (swordStatus == STATUS_INIT || motorTimer != 0 || audioTimer != 0 || ledTimer != 0)
-    //     return;
-
     // 非空闲状态，开机状态，展示状态，跳出检测
     if (triggerState == TRIG_CLICK || triggerState == TRIG_PRESS || triggerState == TRIG_DBCLCK || swordStatus == STATUS_INIT)
         return;
@@ -357,7 +356,7 @@ void judgeActions() {
         // 长按
         if (triggerState == TRIG_PRESS) {
             audioStartTime = millis() + AUDIO_DELAY_TIME;  // 指定音频播放开始时间
-            audioNumber = 2;                               // 指定播放音频
+            audioNumber = 3;                               // 指定播放音频
             motorEndTime = millis() + MOTOR_TIME;          // 指定电机结束震动时间
             setLedEffect(FIGHT_IN);                        // 进入战斗
             setSwordStatus(STATUS_FIGHT);                  // 进入战斗状态
@@ -369,8 +368,10 @@ void judgeActions() {
             // 单击
         } else if (triggerState == TRIG_CLICK) {
             // 熄灭处理
-            setLedEffect(LED_OFF);        // 关灯
-            setSwordStatus(STATUS_INIT);  // 返回开机状态
+            audioStartTime = millis() + AUDIO_DELAY_TIME;  // 指定音频播放开始时间
+            audioNumber = 2;                               // 指定播放音频
+            setLedEffect(LED_OFF);                         // 关灯
+            setSwordStatus(STATUS_INIT);                   // 返回开机状态
 
             // 挥动
         } else if (triggerState == TRIG_SWING) {
@@ -389,7 +390,7 @@ void judgeActions() {
         // 单击
         if (triggerState == TRIG_CLICK) {
             audioStartTime = millis() + AUDIO_DELAY_TIME;  // 指定音频播放开始时间
-            audioNumber = 3;                               // 指定播放音频
+            audioNumber = 2;                               // 指定播放音频
             setLedEffect(RETURN_NORMAL);                   // 返回普通
             setSwordStatus(STATUS_NORMAL);                 // 返回正常状态
 
