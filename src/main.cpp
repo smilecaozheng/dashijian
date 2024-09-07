@@ -4,16 +4,22 @@
 #include <Arduino.h>
 #include <Audio.h>
 #include <FS.h>
-#include <LittleFS.h>
 #include <Preferences.h>
 #include <SPI.h>
+#include <SPIFFS.h>
+#include <WiFi.h>
+#include <driver/i2s.h>
 #include <esp_heap_caps.h>  // ESP-IDF 提供的头文件
-// #include <esp_task_wdt.h>  // 使用任务看门狗库
+#include <esp_task_wdt.h>   // 使用任务看门狗库
+#include <math.h>
 
 #define DEBUG 1  // DEBUG模式
 
 // 功能按钮
 #define BUTTON_PIN 18
+
+const char* ssid = "2703";          // 替换为你的 Wi-Fi SSID
+const char* password = "13763706";  // 替换为你的 Wi-Fi 密码
 
 // 触发器的几种状态
 enum TriggerState {
@@ -40,14 +46,14 @@ const unsigned long LONG_PRESS_TIME = 2000;   // 长按时间 (毫秒)
 const unsigned long SLEEP_TIME = 10000;       // 休眠时间 (毫秒)
 
 // ADXL345加速度传感器
-#define I2C_ADXL345_CS 40
-#define I2C_ADXL345_SCL 36   // SCK
-#define I2C_ADXL345_SDA 37   // MOSI
-#define I2C_ADXL345_MISO 39  // MISO
+#define SPI_ADXL345_CS 40
+#define SPI_ADXL345_SCL 36   // SCK
+#define SPI_ADXL345_SDA 37   // MOSI
+#define SPI_ADXL345_MISO 39  // MISO
 // #define I2C_ADXL345_ADDR 0x53  // 0x1D if SDO = HIGH
 
 // 加速度传感器全局变量
-Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(I2C_ADXL345_SCL, I2C_ADXL345_MISO, I2C_ADXL345_SDA, I2C_ADXL345_CS, 12345);  // 加速度传感器对象
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(SPI_ADXL345_SCL, SPI_ADXL345_MISO, SPI_ADXL345_SDA, SPI_ADXL345_CS, 12345);  // 加速度传感器对象
 sensors_event_t accel_event;                                                                                                           // 加速度传感器事件
 static float prevAccel[3] = {0.0f, 0.0f, 0.0f};                                                                                        // 当前加速度值
 static float currAccel[3] = {0.0f, 0.0f, 0.0f};                                                                                        // 上一次加速度值
@@ -67,7 +73,7 @@ enum SwordStatus {
 volatile SwordStatus swordStatus = STATUS_INIT;      // 大师剑状态
 volatile SwordStatus lastSwordStatus = STATUS_INIT;  // 上一次大师剑状态
 
-// WS2812灯带实例化
+// WS2812灯带
 #define LED_PIN 41
 #define LED_COUNT 52
 #define LED_BRIGHT 50
@@ -89,8 +95,8 @@ enum LedEffect {
     BRIGHTNESS,     // 闪耀
     COLORFUL,       // 炫彩
     LED_ON,         // 熄灭
-    EFFECT_DONE     // 效果切换完成
-
+    EFFECT_DONE,    // 效果切换完成
+    SOUND           // 声音
 };
 
 // 全局变量LED灯
@@ -98,6 +104,7 @@ Adafruit_NeoPixel strip = Adafruit_NeoPixel(LED_COUNT, LED_PIN, NEO_GRB + NEO_KH
 volatile LedEffect ledEffect = LED_OFF;                                                 // LED效果
 volatile int ledCount = 0;                                                              // led计数器
 unsigned long lastLedCountTime = 0;                                                     // 上次led计数时间
+int previousLitLEDs = 0;                                                                // 之前点亮的 LED 数量
 volatile int hueCount = 0;                                                              // hue计数器
 unsigned long lastHueTime = 0;                                                          // 上次hue变化时间
 unsigned long brightEndTime = 0;                                                        // 闪耀结束时间
@@ -116,7 +123,7 @@ const unsigned long MOTOR_TIME = 300;  // 震动超时时间 (毫秒)
 #define I2S_MAX98357_BCLK 12
 #define I2S_MAX98357_LRC 13
 
-Audio audio = Audio(false, 3, I2S_NUM_1);
+Audio audio;
 unsigned long audioStartTime = 0;             // 音频开始时间
 const unsigned long AUDIO_DELAY_TIME = 1000;  // 延时播放时间 (毫秒)
 
@@ -124,9 +131,26 @@ int audioNumber = 0;  // 音频No
 const char* music_list[] = {
     "/", "/001.mp3", "/002.mp3", "/003.mp3"};
 
+// INMP441麦克风模块
+#define I2S_INMP441_WS 33
+#define I2S_INMP441_SD 42
+#define I2S_INMP441_SCK 35
+#define I2S_INMP441_PORT I2S_NUM_1
+
+// INMP441麦克风 全局变量
+int volumePercentage = 0;              // 音量百分比 值 1-100
+float noiseLevel = 40.0;               // 底噪水平
+int32_t maxVolume = 0;                 // 最大音量
+unsigned long lastMicroTime = 0;       // 上次麦克风时间
+const unsigned long TIME_WINDOW = 10;  // 时间窗口，单位为毫秒
+const int BUFFER_SIZE = 512;           // 缓冲区大小
+const float MICRO_SENSITIVITY = 0.8;   // 灵敏度 0.1~1
+const float LED_SMOOTH = 0.3;          // 0.1 是平滑系数，值越大平滑过渡越快
+
 // 函数声明
 void detectButtons();
 void detectADXL();
+void detectMicrophone();
 void judgeActions();
 void ledHandler();
 void motorHandler();
@@ -135,10 +159,14 @@ void setTriggerState(TriggerState state);
 void setSwordStatus(SwordStatus swordStatus);
 void setLedEffect(LedEffect ledEffect);
 void printAccelData(float prev[], float current[]);
+void i2s_install_inmp441();
 void setup() {
     // 开启串口debug输出
     Serial.begin(115200);
     Serial.setDebugOutput(true);
+
+    // 初始化任务看门狗定时器，设置超时时间为 5 秒
+    esp_task_wdt_init(5, true);
 
     delay(2000);
     Serial.println("Serial started");
@@ -146,6 +174,17 @@ void setup() {
     Serial.printf("Deafult free size: %d\n", heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
     Serial.printf("PSRAM free size: %d\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     Serial.printf("Flash size: %d bytes\n", ESP.getFlashChipSize());
+
+    // 连接到 Wi-Fi 网络
+    // WiFi.begin(ssid, password);
+    // while (WiFi.status() != WL_CONNECTED) {
+    //     delay(500);
+    //     Serial.print(".");
+    // }
+    // Serial.println("");
+    // Serial.println("Connected to Wi-Fi");
+    // Serial.println("IP address: ");
+    // Serial.println(WiFi.localIP());
 
     // 初始化按键
     Serial.println("Initializing Button");
@@ -162,55 +201,48 @@ void setup() {
     Serial.println("Initializing Motor");
     pinMode(MOTOR_PIN, OUTPUT);
 
-    // 初始化 SPI
-    SPI.begin(I2C_ADXL345_SCL, I2C_ADXL345_MISO, I2C_ADXL345_SDA, I2C_ADXL345_CS);
-
-    // 初始化ADXL
+    // 初始化SPI ADXL模块
     Serial.println("Initializing ADXL");
-    // Wire.begin(I2C_ADXL345_SDA, I2C_ADXL345_SCL, 100000);
+    SPI.begin(SPI_ADXL345_SCL, SPI_ADXL345_MISO, SPI_ADXL345_SDA, SPI_ADXL345_CS);
     if (!accel.begin()) {
         Serial.println("Ooops, no ADXL345 detected ... Check your wiring!");
         while (1);
     }
     accel.setRange(ADXL345_RANGE_16_G);  // 设置ADXL 量程
 
-    delay(2000);  // 添加延时
-
     // 初始化LittleFS
     Serial.println("Initializing LittleFS");
-    if (!LittleFS.begin()) {
+    // if (!LittleFS.begin()) {
+    if (!SPIFFS.begin()) {
         Serial.println("LittleFS mount failed");
         return;
     }
 
-    // 初始化I2S MAX98357数字功放模块参数
+    // 初始化I2S MAX98357数字功放模块
     Serial.println("Initializing I2S audio module");
     if (!audio.setPinout(I2S_MAX98357_BCLK, I2S_MAX98357_LRC, I2S_MAX98357_DOUT, I2S_GPIO_UNUSED)) {
         Serial.println("Failed to initialize I2S pins");
         return;
     }
-    audio.setBufsize(0, 200 * 1024);  // 0表示使用PSRAM
-    audio.setVolume(21);              // 音量范围0...21
-    // Serial.println("Connecting to /001.mp3");
-    // if (!audio.connecttohost("http://downsc.chinaz.net/Files/DownLoad/sound1/201906/11582.mp3")) {
-    //     // if (!audio.connecttoFS(LittleFS, music_list[1])) {
-    //     Serial.println("Failed to connect to /001.mp3");
-    //     return;  // 如果音频连接失败，退出setup
-    // }
-    // audio.setFileLoop(1);
+    // audio.setBufsize(0, 200 * 1024);  // 0表示使用PSRAM
+    audio.setVolume(21);  // 音量范围0...21
+
+    // 初始化I2S INMP441麦克风
+    Serial.println("Initializing I2S Microphone module");
+    i2s_install_inmp441();
 
     Serial.println("Setup complete");
 }
 
 void loop() {
-    // audio.loop();  // 音频循环
-
-    detectButtons();  // 检测按键
-    detectADXL();     // 检测加速度传感器
-    judgeActions();   // 判断动作
-    ledHandler();     // 处理LED
-    motorHandler();   // 处理震动马达
-    audioHandler();   // 处理音频
+    esp_task_wdt_reset();  // 喂狗操作
+    detectButtons();       // 检测按键
+    detectMicrophone();    // 处理麦克风
+    detectADXL();          // 检测加速度传感器
+    judgeActions();        // 判断动作
+    ledHandler();          // 处理LED
+    motorHandler();        // 处理震动马达
+    audioHandler();        // 处理音频
 }
 
 // 检测按键
@@ -218,22 +250,27 @@ void detectButtons() {
     // 记录当前时间
     unsigned long currentTime = millis();
 
-    // 判断按键状态，低电平：1 ，高电平：0
-    buttonState = digitalRead(BUTTON_PIN) == LOW;
+    int doubleCount = 0;
 
-    // 检查按钮状态
+    // 判断按键状态，低电平：0，高电平：1
+    buttonState = digitalRead(BUTTON_PIN) == LOW;
+    buttonState = !buttonState;
+
+    setTriggerState(TRIG_IDLE);
+
+    // 按钮状态有变化
     if (buttonState != lastButtonState) {
         // 按键按下
-        if (buttonState) {
-            lastPressTime = currentTime;  // 更新上次动作时间
+        if (buttonState == 0) {
+            lastPressTime = currentTime;  // 更新上次按下时间
             longPressTriggered = false;   // 按下按钮时重置长按标志
 
             // 按键松开
         } else {
-            lastReleaseTime = currentTime;  // 更新上次动作时间
+            lastReleaseTime = currentTime;  // 更新上次释放时间
 
             // 判断等待双击标志
-            if (waitingForDoubleClick) {
+            if (waitingForDoubleClick == true) {
                 // 判断双击条件
                 if (currentTime - lastReleaseTime < DOUBLE_CLICK_TIME && !longPressTriggered) {
                     setTriggerState(TRIG_DBCLCK);   // 设置状态：双击
@@ -242,20 +279,23 @@ void detectButtons() {
             } else {
                 //  防止长按后检测到单击或双击
                 if (!longPressTriggered) {
-                    waitingForDoubleClick = true;  // 重置等待双击标志
+                    waitingForDoubleClick = true;  // 等待双击
                     lastActionTime = currentTime;  // 更新上次动作时间
                 }
             }
             // 如果长按已触发，松开时不检测单击
             if (longPressTriggered) {
                 waitingForDoubleClick = false;  // 重置等待双击标志
+                longPressTriggered = false;     // 重置长按
+                lastActionTime = currentTime;   // 更新上次动作时间 防止进入睡眠
             }
         }
         lastButtonState = buttonState;  // 更新上次按键状态
     }
 
     // 长按检测
-    if (buttonState && (currentTime - lastPressTime > LONG_PRESS_TIME) && !longPressTriggered) {
+    // 按键低电平 长按表示没有被触发
+    if (buttonState == 0 && (currentTime - lastPressTime > LONG_PRESS_TIME) && longPressTriggered == false) {
         setTriggerState(TRIG_PRESS);    // 设置状态：长按
         longPressTriggered = true;      // 触发长按
         waitingForDoubleClick = false;  // 重置等待双击标志
@@ -263,13 +303,15 @@ void detectButtons() {
     }
 
     // 睡眠检测
-    if (!buttonState && (currentTime - lastActionTime > SLEEP_TIME) && !sleepTriggered) {
+    // 按键高电平，超过睡眠时间，睡眠等待标志没有被触发
+    if (buttonState == 1 && (currentTime - lastActionTime > SLEEP_TIME) && sleepTriggered == false) {
         setTriggerState(TRIG_SLEEP);   // 设置状态：睡眠
         sleepTriggered = true;         // 触发睡眠
         lastActionTime = currentTime;  // 更新上次动作时间 防止进入睡眠
     }
 
     // 单击检测
+    // 按键释放等待第二次按下，超过双击等待时间
     if (waitingForDoubleClick && (currentTime - lastReleaseTime > DOUBLE_CLICK_TIME)) {
         setTriggerState(TRIG_CLICK);    // 设置状态：单击
         waitingForDoubleClick = false;  // 重置等待双击标志 防止单击后检测到双击
@@ -277,18 +319,8 @@ void detectButtons() {
     }
 
     // 如果有按键触发，则不触发睡眠状态
-    if (buttonState || waitingForDoubleClick || longPressTriggered) {
+    if (buttonState == 0 || waitingForDoubleClick || longPressTriggered) {
         sleepTriggered = false;  // 重置睡眠标志
-    }
-
-    // 进入睡眠状态后重置活动时间，防止反复触发
-    if (triggerState == TRIG_SLEEP) {
-        lastActionTime = currentTime;  // 更新上次动作时间
-    }
-
-    // 闲置检测
-    if (!buttonState && !waitingForDoubleClick && !longPressTriggered && !sleepTriggered) {
-        // setTriggerState(TRIG_IDLE);  // 设置状态：空闲
     }
 }
 
@@ -320,6 +352,7 @@ void detectADXL() {
 
             // 更新挥动的最后时间
             lastActionTime = currentTime;  // 更新 lastActionTime 防止进入睡眠
+            sleepTriggered = false;
 
             // 打印大师剑和触发器状态，触发时间，加速度参数
             printAccelData(prevAccel, currAccel);
@@ -331,7 +364,63 @@ void detectADXL() {
     prevAccel[1] = accel_event.acceleration.y;
     prevAccel[2] = accel_event.acceleration.z;
 }
+void detectMicrophone() {
+    if (swordStatus != STATUS_DISPLAY || ledEffect != SOUND) return;
+    unsigned long currentTime = millis();
 
+    int16_t buffer[BUFFER_SIZE];
+    size_t bytes_read;
+
+    // 读取音频数据
+    esp_err_t err = i2s_read(I2S_INMP441_PORT, buffer, sizeof(buffer), &bytes_read, portMAX_DELAY);
+    if (err != ESP_OK) {
+        Serial.printf("I2S read error: %d\n", err);
+        return;
+    }
+
+    // 计算当前时间窗口的最大音量
+    int16_t currentMaxVolume = 0;
+    int32_t sampleCount = bytes_read / sizeof(int16_t);
+
+    for (int i = 0; i < sampleCount; i++) {
+        int16_t sample = abs(buffer[i]);
+        if (sample > currentMaxVolume) {
+            currentMaxVolume = sample;
+        }
+    }
+
+    // 计算底噪水平并输出到串口
+    // 只在调试时计算底噪水平，不在计算音量时使用
+    if (currentTime - lastMicroTime >= TIME_WINDOW) {
+        Serial.print("Noise Level: ");
+        Serial.println(currentMaxVolume);  // 输出底噪水平供手动调整
+
+        lastMicroTime = currentTime;
+
+        // 更新最大音量
+        maxVolume = currentMaxVolume;
+
+        // 计算实际音量（减去底噪）
+        int16_t adjustedVolume = maxVolume - (int16_t)noiseLevel;
+        if (adjustedVolume < 0) {
+            adjustedVolume = 0;  // 避免负值
+        }
+
+        // 将调整后的音量转换为百分比
+        // 对于 16 位音频，最大值为 32767
+        volumePercentage = (int)round((adjustedVolume * MICRO_SENSITIVITY * 327.7 / 32767.0) * 100.0);
+        if (volumePercentage > 100) {
+            volumePercentage = 100;  // 确保百分比不超过100%
+        }
+
+        // 重置最大音量以便于下一时间窗口的计算
+        maxVolume = 0;
+
+        // 输出调整后的音量百分比到串口
+        // Serial.print("Volume Percentage: ");
+        // Serial.println(volumePercentage);
+    }
+}
 // 判断动作
 void judgeActions() {
     // 开机状态
@@ -352,7 +441,7 @@ void judgeActions() {
         }
 
         // 普通状态
-    } else if (swordStatus == STATUS_NORMAL && ledEffect == EFFECT_DONE) {
+    } else if (swordStatus == STATUS_NORMAL) {
         // 长按
         if (triggerState == TRIG_PRESS) {
             audioStartTime = millis() + AUDIO_DELAY_TIME;  // 指定音频播放开始时间
@@ -386,7 +475,7 @@ void judgeActions() {
         }
 
         // 战斗状态
-    } else if (swordStatus == STATUS_FIGHT && ledEffect == EFFECT_DONE) {
+    } else if (swordStatus == STATUS_FIGHT) {
         // 单击
         if (triggerState == TRIG_CLICK) {
             audioStartTime = millis() + AUDIO_DELAY_TIME;  // 指定音频播放开始时间
@@ -411,12 +500,11 @@ void judgeActions() {
         // 展示状态
     } else if (swordStatus == STATUS_DISPLAY) {
         // 双击
-        if (triggerState == TRIG_DBCLCK) {
-            // 切换拾音灯 模式
-
-        } else if (triggerState != TRIG_SLEEP) {
+        if (triggerState == TRIG_SWING || triggerState == TRIG_CLICK) {
             setLedEffect(RETURN_LAST);        // 返回上一次效果
             setSwordStatus(lastSwordStatus);  // 返回上一次状态
+        } else if (triggerState == TRIG_DBCLCK) {
+            setLedEffect(SOUND);  // 拾音灯效果
         }
     }
 }
@@ -502,6 +590,35 @@ void ledHandler() {
         }
     }
 
+    if (ledEffect == SOUND) {
+        strip.setBrightness(LED_BRIGHT);  // 恢复亮度
+        // 计算当前应点亮的 LED 数量
+        int targetLitLEDs = round(strip.numPixels() * volumePercentage / 100);
+
+        // 计算点亮的 LED 数量的平滑过渡
+        int litLEDs = previousLitLEDs + (targetLitLEDs - previousLitLEDs) * LED_SMOOTH;  // 0.1 是平滑系数，值越大平滑过渡越快
+
+        if (hueCount < 256 * 5 && (currentTime - lastHueTime > HUE_UPDATE_TIME)) {
+            for (ledCount; ledCount < strip.numPixels(); ledCount++) {
+                uint16_t hue = (ledCount * 65536L / strip.numPixels()) - (hueCount * 256);
+                if (ledCount < strip.numPixels() - litLEDs) {
+                    strip.setPixelColor(ledCount, OFF);
+                } else {
+                    strip.setPixelColor(ledCount, strip.gamma32(strip.ColorHSV(hue)));
+                }
+            }
+            strip.show();
+            ledCount = 0;
+            hueCount++;
+            lastHueTime = currentTime;
+        } else if (hueCount >= 256 * 5) {
+            hueCount = 0;
+        }
+
+        // 更新之前的点亮 LED 数量
+        previousLitLEDs = litLEDs;
+    }
+
     if (ledEffect == RETURN_LAST) {
         if (lastSwordStatus == STATUS_INIT) {
             setLedEffect(LED_OFF);
@@ -515,6 +632,7 @@ void ledHandler() {
 
 // 处理震动
 void motorHandler() {
+    if (swordStatus == STATUS_DISPLAY) return;
     // 记录当前时间
     unsigned long currentTime = millis();
     if (currentTime < motorEndTime && digitalRead(MOTOR_PIN) == LOW) {
@@ -527,17 +645,17 @@ void motorHandler() {
 
 // 处理音频
 void audioHandler() {
-    // 记录当前时间
+    if (swordStatus == STATUS_DISPLAY) return;
     unsigned long currentTime = millis();
     int number;
-
+    audio.loop();
     if (currentTime < audioStartTime && audio.isRunning() == false && audioNumber != 0) {
         number = audioNumber;
         audioNumber = 0;
         Serial.print("Connecting to ");
         Serial.print(music_list[number]);
         Serial.println(" to play audio...");
-        audio.connecttoFS(LittleFS, music_list[number]);  // 使用LittleFS和MP3文件路径进行连接
+        audio.connecttoFS(SPIFFS, music_list[number]);  // 使用LittleFS和MP3文件路径进行连接
     }
 }
 
@@ -561,6 +679,7 @@ void setTriggerState(TriggerState state) {
             Serial.println("TRIG_SWING");
             break;
         case TRIG_IDLE:
+            // Serial.println("TRIG_IDLE");
             break;
     }
 }
@@ -632,6 +751,9 @@ void setLedEffect(LedEffect effect) {
         case RETURN_LAST:
             Serial.println("RETURN_LAST");
             break;
+        case SOUND:
+            Serial.println("SOUND");
+            break;
     }
 }
 
@@ -652,4 +774,42 @@ void printAccelData(float prev[], float current[]) {
     Serial.print("  Z: ");
     Serial.print(current[2]);
     Serial.println(" m/s^2");
+}
+
+void i2s_install_inmp441() {
+    const i2s_config_t i2s_config = {
+        .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = 8000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,  // 修改为 16 位
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S),
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 8,
+        .dma_buf_len = 64,
+        .use_apll = false};
+
+    const i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_INMP441_SCK,
+        .ws_io_num = I2S_INMP441_WS,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = I2S_INMP441_SD};
+
+    esp_err_t err;
+    err = i2s_driver_install(I2S_INMP441_PORT, &i2s_config, 0, NULL);
+    if (err != ESP_OK) {
+        Serial.printf("Failed to install I2S driver for INMP441: %d\n", err);
+        return;
+    }
+
+    err = i2s_set_pin(I2S_INMP441_PORT, &pin_config);
+    if (err != ESP_OK) {
+        Serial.printf("Failed to set I2S pins for INMP441: %d\n", err);
+        return;
+    }
+
+    // err = i2s_set_clk(I2S_INMP441_PORT, 8000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+    // if (err != ESP_OK) {
+    //     Serial.printf("Failed to set I2S clock for INMP441: %d\n", err);
+    //     return;
+    // }
 }
